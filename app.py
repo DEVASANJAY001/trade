@@ -4,8 +4,9 @@ import pandas as pd
 from fastapi import FastAPI
 from kiteconnect import KiteConnect, KiteTicker
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import threading
-import pytz
+import time
 
 # ==============================
 # CONFIG
@@ -41,8 +42,7 @@ tracked_tokens = []
 # ==============================
 
 def market_open():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
     if now.weekday() >= 5:
         return False
@@ -80,12 +80,13 @@ def load_instruments():
     instrument_df = df
     tracked_tokens = df["instrument_token"].tolist()
 
+    print(f"Loaded {len(tracked_tokens)} contracts")
+
 # ==============================
 # WEBSOCKET EVENTS
 # ==============================
 
 def on_ticks(ws, ticks):
-    global latest_ticks
     for tick in ticks:
         latest_ticks[tick["instrument_token"]] = tick
 
@@ -96,13 +97,16 @@ def on_connect(ws, response):
 
 def on_close(ws, code, reason):
     print("WebSocket closed:", reason)
+    print("Reconnecting in 3 seconds...")
+    time.sleep(3)
+    threading.Thread(target=kws.connect, daemon=True).start()
 
 kws.on_ticks = on_ticks
 kws.on_connect = on_connect
 kws.on_close = on_close
 
 # ==============================
-# RANKING ENGINE
+# RANKING ENGINE (1 SECOND LOOP)
 # ==============================
 
 async def ranking_engine():
@@ -110,72 +114,64 @@ async def ranking_engine():
 
     while True:
         try:
-            if not market_open():
-                await asyncio.sleep(5)
-                continue
+            if market_open() and instrument_df is not None:
 
-            rows = []
+                rows = []
 
-            for _, row in instrument_df.iterrows():
-                token = row["instrument_token"]
-                tick = latest_ticks.get(token)
+                for _, row in instrument_df.iterrows():
+                    token = row["instrument_token"]
+                    tick = latest_ticks.get(token)
 
-                if not tick:
-                    continue
+                    if not tick:
+                        continue
 
-                bid = tick.get("depth", {}).get("buy", [{}])[0].get("price", 0)
-                ask = tick.get("depth", {}).get("sell", [{}])[0].get("price", 0)
-                spread = ask - bid if bid and ask else 0
+                    bid = tick.get("depth", {}).get("buy", [{}])[0].get("price", 0)
+                    ask = tick.get("depth", {}).get("sell", [{}])[0].get("price", 0)
+                    spread = ask - bid if bid and ask else 0
 
-                rows.append({
-                    "symbol": row["tradingsymbol"],
-                    "strike": row["strike"],
-                    "type": row["instrument_type"],
-                    "ltp": tick.get("last_price", 0),
-                    "volume": tick.get("volume", 0),
-                    "oi": tick.get("oi", 0),
-                    "change": tick.get("change", 0),
-                    "spread": spread
-                })
+                    rows.append({
+                        "symbol": row["tradingsymbol"],
+                        "strike": row["strike"],
+                        "type": row["instrument_type"],
+                        "ltp": tick.get("last_price", 0),
+                        "volume": tick.get("volume", 0),
+                        "oi": tick.get("oi", 0),
+                        "change": tick.get("change", 0),
+                        "spread": spread
+                    })
 
-            df = pd.DataFrame(rows)
+                df = pd.DataFrame(rows)
 
-            if df.empty:
-                await asyncio.sleep(1)
-                continue
+                if not df.empty:
 
-            # Liquidity filter
-            df = df[
-                (df["volume"] > MIN_VOLUME) &
-                (df["oi"] > MIN_OI) &
-                (df["spread"] < 5)
-            ]
+                    df = df[
+                        (df["volume"] > MIN_VOLUME) &
+                        (df["oi"] > MIN_OI) &
+                        (df["spread"] < 5)
+                    ]
 
-            if df.empty:
-                await asyncio.sleep(1)
-                continue
+                    if not df.empty:
 
-            # Scoring model
-            df["volume_score"] = df["volume"] / df["volume"].max()
-            df["oi_score"] = df["oi"] / df["oi"].max()
-            df["change_score"] = abs(df["change"]) / (abs(df["change"]).max() or 1)
+                        df["volume_score"] = df["volume"] / df["volume"].max()
+                        df["oi_score"] = df["oi"] / df["oi"].max()
+                        df["change_score"] = abs(df["change"]) / (abs(df["change"]).max() or 1)
 
-            df["score"] = (
-                df["volume_score"] * 0.4 +
-                df["oi_score"] * 0.3 +
-                df["change_score"] * 0.3
-            )
+                        df["score"] = (
+                            df["volume_score"] * 0.4 +
+                            df["oi_score"] * 0.3 +
+                            df["change_score"] * 0.3
+                        )
 
-            df["confidence"] = (df["score"] * 100).round(2)
+                        df["confidence"] = (df["score"] * 100).round(2)
 
-            latest_ranked = df.sort_values(
-                "score", ascending=False
-            ).to_dict(orient="records")
+                        latest_ranked = df.sort_values(
+                            "score", ascending=False
+                        ).to_dict(orient="records")
 
         except Exception as e:
             print("Ranking error:", e)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(1)  # 🔥 EXACT 1 SECOND UPDATE
 
 # ==============================
 # STARTUP
@@ -187,7 +183,7 @@ async def startup():
     print("Loading instruments...")
     load_instruments()
 
-    print("Starting WebSocket...")
+    print("Starting Kite WebSocket...")
     threading.Thread(target=kws.connect, daemon=True).start()
 
     asyncio.create_task(ranking_engine())
@@ -198,10 +194,15 @@ async def startup():
 
 @app.get("/")
 def root():
-    return {"status": "Realtime WebSocket backend running"}
+    return {"status": "High Speed Options Scanner Running"}
 
 @app.get("/scan")
 def scan():
+
+    if not market_open():
+        return {"message": "Market Closed"}
+
     if not latest_ranked:
-        return {"message": "Waiting for live ticks..."}
+        return {"message": "Collecting Live Data..."}
+
     return latest_ranked
