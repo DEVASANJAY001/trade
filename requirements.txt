@@ -4,4 +4,3 @@ pandas
 numpy
 kiteconnect
 supabase
-pytz
