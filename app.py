@@ -253,6 +253,10 @@ async def startup():
 def root():
     return {"status": "3s Supabase Scanner Running"}
 
-@app.get("/health")
-def health():
-    return {"status": "running"}
+@app.get("/scan")
+def scan():
+    if not market_open():
+        return {"message": "Market Closed"}
+    return {"message": "Running"}
+
+
