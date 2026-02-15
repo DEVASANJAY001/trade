@@ -1,49 +1,44 @@
 import os
-import time
-import numpy as np
+import asyncio
 import pandas as pd
 from fastapi import FastAPI
-from kiteconnect import KiteConnect
-from supabase import create_client
+from kiteconnect import KiteConnect, KiteTicker
 from datetime import datetime
+import threading
 import pytz
 
-# ======================
-# ENV VARIABLES (Render)
-# ======================
+# ==============================
+# CONFIG
+# ==============================
 
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 INDEX = "NIFTY"
 STRIKE_RANGE = 800
 MAX_CONTRACTS = 80
+MIN_VOLUME = 10000
+MIN_OI = 50000
 
-# ======================
+# ==============================
 # INIT
-# ======================
+# ==============================
 
 app = FastAPI()
 
 kite = KiteConnect(api_key=KITE_API_KEY)
 kite.set_access_token(KITE_ACCESS_TOKEN)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+kws = KiteTicker(KITE_API_KEY, KITE_ACCESS_TOKEN)
 
-# ======================
-# ROOT ROUTE
-# ======================
+latest_ticks = {}
+latest_ranked = []
+instrument_df = None
+tracked_tokens = []
 
-@app.get("/")
-def root():
-    return {"status": "Backend running"}
-
-# ======================
-# MARKET HOURS CHECK
-# ======================
+# ==============================
+# MARKET HOURS
+# ==============================
 
 def market_open():
     ist = pytz.timezone("Asia/Kolkata")
@@ -57,141 +52,156 @@ def market_open():
         return False
     return True
 
-# ======================
-# GET PRICE
-# ======================
+# ==============================
+# LOAD INSTRUMENTS
+# ==============================
 
-def get_price():
-    q = kite.ltp("NSE:NIFTY 50")
-    return list(q.values())[0]["last_price"]
+def load_instruments():
+    global instrument_df, tracked_tokens
 
-# ======================
-# VOLUME SPIKE ENGINE (DB BASED)
-# ======================
+    instruments = pd.DataFrame(kite.instruments("NFO"))
 
-def update_volume(symbol_key, volume):
-    supabase.table("volume_history").insert({
-        "token": symbol_key,
-        "volume": volume
-    }).execute()
+    df = instruments[
+        (instruments["name"] == INDEX) &
+        (instruments["segment"].str.contains("OPT"))
+    ]
 
-def calculate_spike(symbol_key):
-    now = datetime.utcnow()
-    five_min_ago = now - pd.Timedelta(minutes=5)
+    expiry = sorted(df["expiry"].unique())[0]
+    df = df[df["expiry"] == expiry]
 
-    history = supabase.table("volume_history") \
-        .select("*") \
-        .eq("token", symbol_key) \
-        .gte("created_at", five_min_ago.strftime("%Y-%m-%dT%H:%M:%S")) \
-        .execute().data
+    index_price = kite.ltp("NSE:NIFTY 50")
+    price = list(index_price.values())[0]["last_price"]
 
-    if len(history) < 2:
-        return 0, 0, 0, 0, 0
+    df = df[
+        (df["strike"] > price - STRIKE_RANGE) &
+        (df["strike"] < price + STRIKE_RANGE)
+    ].head(MAX_CONTRACTS)
 
-    df = pd.DataFrame(history)
-    df["created_at"] = pd.to_datetime(df["created_at"])
-    df = df.sort_values("created_at")
+    instrument_df = df
+    tracked_tokens = df["instrument_token"].tolist()
 
-    def window(seconds):
-        cutoff = now - pd.Timedelta(seconds=seconds)
-        window_df = df[df["created_at"] >= cutoff]
-        if len(window_df) >= 2:
-            return window_df.iloc[-1]["volume"] - window_df.iloc[0]["volume"]
-        return 0
+# ==============================
+# WEBSOCKET EVENTS
+# ==============================
 
-    return (
-        window(10),
-        window(30),
-        window(60),
-        window(180),
-        window(300),
-    )
+def on_ticks(ws, ticks):
+    global latest_ticks
+    for tick in ticks:
+        latest_ticks[tick["instrument_token"]] = tick
 
-# ======================
-# MAIN OPTION SCAN
-# ======================
+def on_connect(ws, response):
+    print("WebSocket connected")
+    ws.subscribe(tracked_tokens)
+    ws.set_mode(ws.MODE_FULL, tracked_tokens)
+
+def on_close(ws, code, reason):
+    print("WebSocket closed:", reason)
+
+kws.on_ticks = on_ticks
+kws.on_connect = on_connect
+kws.on_close = on_close
+
+# ==============================
+# RANKING ENGINE
+# ==============================
+
+async def ranking_engine():
+    global latest_ranked
+
+    while True:
+        try:
+            if not market_open():
+                await asyncio.sleep(5)
+                continue
+
+            rows = []
+
+            for _, row in instrument_df.iterrows():
+                token = row["instrument_token"]
+                tick = latest_ticks.get(token)
+
+                if not tick:
+                    continue
+
+                bid = tick.get("depth", {}).get("buy", [{}])[0].get("price", 0)
+                ask = tick.get("depth", {}).get("sell", [{}])[0].get("price", 0)
+                spread = ask - bid if bid and ask else 0
+
+                rows.append({
+                    "symbol": row["tradingsymbol"],
+                    "strike": row["strike"],
+                    "type": row["instrument_type"],
+                    "ltp": tick.get("last_price", 0),
+                    "volume": tick.get("volume", 0),
+                    "oi": tick.get("oi", 0),
+                    "change": tick.get("change", 0),
+                    "spread": spread
+                })
+
+            df = pd.DataFrame(rows)
+
+            if df.empty:
+                await asyncio.sleep(1)
+                continue
+
+            # Liquidity filter
+            df = df[
+                (df["volume"] > MIN_VOLUME) &
+                (df["oi"] > MIN_OI) &
+                (df["spread"] < 5)
+            ]
+
+            if df.empty:
+                await asyncio.sleep(1)
+                continue
+
+            # Scoring model
+            df["volume_score"] = df["volume"] / df["volume"].max()
+            df["oi_score"] = df["oi"] / df["oi"].max()
+            df["change_score"] = abs(df["change"]) / (abs(df["change"]).max() or 1)
+
+            df["score"] = (
+                df["volume_score"] * 0.4 +
+                df["oi_score"] * 0.3 +
+                df["change_score"] * 0.3
+            )
+
+            df["confidence"] = (df["score"] * 100).round(2)
+
+            latest_ranked = df.sort_values(
+                "score", ascending=False
+            ).to_dict(orient="records")
+
+        except Exception as e:
+            print("Ranking error:", e)
+
+        await asyncio.sleep(1)
+
+# ==============================
+# STARTUP
+# ==============================
+
+@app.on_event("startup")
+async def startup():
+
+    print("Loading instruments...")
+    load_instruments()
+
+    print("Starting WebSocket...")
+    threading.Thread(target=kws.connect, daemon=True).start()
+
+    asyncio.create_task(ranking_engine())
+
+# ==============================
+# ROUTES
+# ==============================
+
+@app.get("/")
+def root():
+    return {"status": "Realtime WebSocket backend running"}
 
 @app.get("/scan")
-def scan_options():
-
-    try:
-
-        if not market_open():
-            return {"message": "Market closed"}
-
-        instruments = pd.DataFrame(kite.instruments())
-
-        df = instruments[
-            (instruments["name"] == INDEX) &
-            (instruments["segment"].str.contains("OPT"))
-        ]
-
-        expiry = sorted(df["expiry"].unique())[0]
-        df = df[df["expiry"] == expiry]
-
-        price = get_price()
-
-        df = df[
-            (df["strike"] > price - STRIKE_RANGE) &
-            (df["strike"] < price + STRIKE_RANGE)
-        ].head(MAX_CONTRACTS)
-
-        # ✅ FIXED: Use tradingsymbol with exchange prefix
-        symbols = ["NFO:" + row["tradingsymbol"] for _, row in df.iterrows()]
-        quotes = kite.quote(symbols)
-
-        results = []
-
-        for _, row in df.iterrows():
-
-            symbol_key = "NFO:" + row["tradingsymbol"]
-            q = quotes.get(symbol_key, {})
-
-            volume = q.get("volume", 0)
-
-            update_volume(symbol_key, volume)
-            v10, v30, v1m, v3m, v5m = calculate_spike(symbol_key)
-
-            results.append({
-                "symbol": row["tradingsymbol"],
-                "strike": row["strike"],
-                "type": row["instrument_type"],
-                "ltp": q.get("last_price", 0),
-                "volume": volume,
-                "oi": q.get("oi", 0),
-                "oi_change": q.get("oi", 0) - q.get("oi_day_low", 0),
-                "iv": q.get("implied_volatility", 0),
-                "vol_10s": v10,
-                "vol_30s": v30,
-                "vol_1m": v1m,
-                "vol_3m": v3m,
-                "vol_5m": v5m
-            })
-
-        df_final = pd.DataFrame(results)
-
-        if df_final.empty:
-            return {"message": "No contracts found"}
-
-        # ======================
-        # SCORING
-        # ======================
-
-        df_final["score"] = (
-            df_final["volume"].rank(pct=True) * 0.2 +
-            df_final["oi"].rank(pct=True) * 0.2 +
-            df_final["iv"].rank(pct=True) * 0.2 +
-            df_final["vol_1m"].rank(pct=True) * 0.4
-        )
-
-        df_final["confidence"] = (df_final["score"] * 100).round(2)
-
-        # Save snapshot
-        supabase.table("option_snapshots").insert(
-            df_final.to_dict(orient="records")
-        ).execute()
-
-        return df_final.sort_values("score", ascending=False).to_dict(orient="records")
-
-    except Exception as e:
-        return {"error": str(e)}
+def scan():
+    if not latest_ranked:
+        return {"message": "Waiting for live ticks..."}
+    return latest_ranked
